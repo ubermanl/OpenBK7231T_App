@@ -39,7 +39,7 @@ static const char *g_wemo_setup_4 =
 "</serialNumber>"
 "<presentationURL>http://";
 static const char *g_wemo_setup_5 =
-":80/</presentationURL>"
+"/</presentationURL>"
 "<binaryState>0</binaryState>";
 static const char *g_wemo_setup_6 =
 	"<serviceList>"
@@ -66,7 +66,7 @@ const char *g_wemo_msearch =
 "CACHE-CONTROL: max-age=86400\r\n"
 "DATE: Fri, 15 Apr 2016 04:56:29 GMT\r\n"
 "EXT:\r\n"
-"LOCATION: http://%s:80/setup.xml\r\n"
+"LOCATION: http://%s:%d/setup.xml\r\n"
 "OPT: \"http://schemas.upnp.org/upnp/1/0/\"; ns=01\r\n"
 "01-NLS: b9200ebb-736d-4b93-bf03-835149d13983\r\n"
 "SERVER: Unspecified, UPnP/1.0, Unspecified\r\n"
@@ -152,8 +152,16 @@ const char *g_wemo_response_2_fmt =
 "</s:Body>"
 "</s:Envelope>\r\n";
 
+// Multi-channel support: when several relay channels are configured, every relay is exposed to Alexa
+// as a separate Wemo device. Alexa tells such devices apart by TCP port, so device 0 stays on port 80
+// (as before) and device N is served on WEMO_PORT_BASE + N - 1.
+#define WEMO_MAX_DEVICES	3
+#define WEMO_PORT_BASE		8081
+
 static char *g_serial = 0;
 static char *g_uid = 0;
+static char g_devSerial[WEMO_MAX_DEVICES][32];
+static char g_devUid[WEMO_MAX_DEVICES][64];
 static int outBufferLen = 0;
 static char *buffer_out = 0;
 static int stat_searchesReceived = 0;
@@ -162,8 +170,79 @@ static int stat_metaServiceXMLVisits = 0;
 static int stat_eventsReceived = 0;
 static int stat_eventServiceXMLVisits = 0;
 
+static int WEMO_PortForDevice(int idx) {
+	return (idx <= 0) ? 80 : (WEMO_PORT_BASE + idx - 1);
+}
+
+// device index served on a given local TCP port
+static int WEMO_DevIndex(http_request_t* request) {
+	int idx = 0;
+	if (request->localPort >= WEMO_PORT_BASE) {
+		idx = request->localPort - WEMO_PORT_BASE + 1;
+	}
+	if (idx < 0 || idx >= WEMO_MAX_DEVICES) {
+		idx = 0;
+	}
+	return idx;
+}
+
+// number of virtual devices = number of relay channels (at least 1, at most WEMO_MAX_DEVICES)
+static int WEMO_CountDevices() {
+	int i, count = 0;
+#if HTTP_EXTRA_PORTS_SUPPORTED
+#if ENABLE_LED_BASIC
+	if (LED_IsLEDRunning()) {
+		return 1;
+	}
+#endif
+	for (i = 0; i < CHANNEL_MAX; i++) {
+		if (h_isChannelRelay(i) || CHANNEL_GetType(i) == ChType_Toggle) {
+			count++;
+			if (count >= WEMO_MAX_DEVICES) {
+				break;
+			}
+		}
+	}
+#endif
+	return count < 1 ? 1 : count;
+}
+
+// channel number of the idx-th relay channel, -1 if none
+static int WEMO_GetDeviceChannel(int idx) {
+	int i, n = 0;
+	for (i = 0; i < CHANNEL_MAX; i++) {
+		if (h_isChannelRelay(i) || CHANNEL_GetType(i) == ChType_Toggle) {
+			if (n == idx) {
+				return i;
+			}
+			n++;
+		}
+	}
+	return -1;
+}
+
+// opens the extra HTTP ports needed by devices 1..N-1 (and closes unused ones)
+static void WEMO_UpdatePorts() {
+#if HTTP_EXTRA_PORTS_SUPPORTED
+	int i, count = WEMO_CountDevices();
+	for (i = 1; i < WEMO_MAX_DEVICES; i++) {
+		HTTPServer_SetExtraPort(i - 1, (i < count) ? WEMO_PortForDevice(i) : 0);
+	}
+#endif
+}
+
+void WEMO_Stop() {
+#if HTTP_EXTRA_PORTS_SUPPORTED
+	int i;
+	for (i = 1; i < WEMO_MAX_DEVICES; i++) {
+		HTTPServer_SetExtraPort(i - 1, 0);
+	}
+#endif
+}
+
 void DRV_WEMO_Send_Advert_To(int mode, struct sockaddr_in *addr) {
 	const char *useType;
+	int i, count;
 
 	if (g_uid == 0) {
 		// not running
@@ -179,23 +258,33 @@ void DRV_WEMO_Send_Advert_To(int mode, struct sockaddr_in *addr) {
 		useType = "upnp:rootdevice";
 	}
 
-	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_HTTP, "WEMO - sends reply %s",useType);
+	WEMO_UpdatePorts();
+	count = WEMO_CountDevices();
+
+	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_HTTP, "WEMO - sends reply %s for %i device(s)",useType, count);
 
 	if (buffer_out == 0) {
 		outBufferLen = strlen(g_wemo_msearch) + 256;
 		buffer_out = (char*)malloc(outBufferLen);
 	}
-	snprintf(buffer_out, outBufferLen, g_wemo_msearch, HAL_GetMyIPString(), useType, g_uid, useType);
+	for (i = 0; i < count; i++) {
+		snprintf(buffer_out, outBufferLen, g_wemo_msearch, HAL_GetMyIPString(), WEMO_PortForDevice(i), useType, g_devUid[i], useType);
 
-	addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_HTTP, "WEMO - Sending %s", buffer_out);
-	DRV_SSDP_SendReply(addr, buffer_out);
+		addLogAdv(LOG_EXTRADEBUG, LOG_FEATURE_HTTP, "WEMO - Sending %s", buffer_out);
+		DRV_SSDP_SendReply(addr, buffer_out);
+#if HTTP_EXTRA_PORTS_SUPPORTED
+		if (i + 1 < count) {
+			rtos_delay_milliseconds(10);
+		}
+#endif
+	}
 }
 
 void WEMO_AppendInformationToHTTPIndexPage(http_request_t* request, int bPreState) {
 	if(bPreState)
 		return;
-	hprintf255(request, "<h4>WEMO: searches %i, setup %i, events %i, mService %i, event %i </h4>",
-		stat_searchesReceived, stat_setupXMLVisits, stat_eventsReceived, stat_metaServiceXMLVisits, stat_eventServiceXMLVisits);
+	hprintf255(request, "<h4>WEMO: devices %i, searches %i, setup %i, events %i, mService %i, event %i </h4>",
+		WEMO_CountDevices(), stat_searchesReceived, stat_setupXMLVisits, stat_eventsReceived, stat_metaServiceXMLVisits, stat_eventServiceXMLVisits);
 
 }
 
@@ -229,22 +318,41 @@ static int WEMO_BasicEvent1(http_request_t* request) {
 	*/
 	// Set and Get are the same so we can hack just one letter
 	char letter;
+	int devIdx = WEMO_DevIndex(request);
+	int devCh = (WEMO_CountDevices() > 1) ? WEMO_GetDeviceChannel(devIdx) : -1;
+	int bMainPower;
 	// is this a Set request?
 	if (strstr(cmd, "SetBinaryState")) {
 		// set
 		letter = 'S';
-		if (strstr(cmd, "State>1</Binary")) {
-			CMD_ExecuteCommand("POWER ON", 0);
+		if (devCh >= 0) {
+			// multi-channel: only touch the channel of this virtual device
+			if (strstr(cmd, "State>1</Binary")) {
+				CHANNEL_Set(devCh, 1, 0);
+			}
+			if (strstr(cmd, "State>0</Binary")) {
+				CHANNEL_Set(devCh, 0, 0);
+			}
 		}
-		if (strstr(cmd, "State>0</Binary")) {
-			CMD_ExecuteCommand("POWER OFF", 0);
+		else {
+			if (strstr(cmd, "State>1</Binary")) {
+				CMD_ExecuteCommand("POWER ON", 0);
+			}
+			if (strstr(cmd, "State>0</Binary")) {
+				CMD_ExecuteCommand("POWER OFF", 0);
+			}
 		}
 	}
 	else {
 		// get
 		letter = 'G';
 	}
-	int bMainPower = Main_GetFirstPowerState();
+	if (devCh >= 0) {
+		bMainPower = CHANNEL_Get(devCh) ? 1 : 0;
+	}
+	else {
+		bMainPower = Main_GetFirstPowerState();
+	}
 
 	// We must send a SetBinaryState or GetBinaryState response depending on what 
 	// was sent to us	
@@ -280,19 +388,43 @@ static int WEMO_MetaInfoService(http_request_t* request) {
 	return 0;
 }
 static int WEMO_Setup(http_request_t* request) {
+	int idx = WEMO_DevIndex(request);
+	char name[24];
+
+	if (idx >= WEMO_CountDevices()) {
+		idx = 0;
+	}
 	http_setup(request, httpMimeTypeXML);
 	poststr(request, g_wemo_setup_1);
 	// friendly name
-	poststr(request, CFG_GetDeviceName());
+	if (WEMO_CountDevices() > 1) {
+		snprintf(name, sizeof(name), "Switch %i", idx + 1);
+		poststr(request, name);
+	}
+	else {
+		poststr(request, CFG_GetDeviceName());
+	}
 	poststr(request, g_wemo_setup_2);
 	// uuid
-	poststr(request, g_uid);
+	poststr(request, g_devUid[idx]);
 	poststr(request, g_wemo_setup_3);
-	// IP str
-	poststr(request, HAL_GetMyIPString());
+	// Device 0 keeps its historic layout (IP in serialNumber, serial in presentationURL host),
+	// so Alexa keeps recognising an already added device.
+	// Other devices use serialNumber/presentationURL the regular way.
+	if (idx == 0) {
+		poststr(request, HAL_GetMyIPString());
+	}
+	else {
+		poststr(request, g_devSerial[idx]);
+	}
 	poststr(request, g_wemo_setup_4);
-	// serial str
-	poststr(request, g_serial);
+	if (idx == 0) {
+		poststr(request, g_devSerial[0]);
+	}
+	else {
+		poststr(request, HAL_GetMyIPString());
+	}
+	hprintf255(request, ":%i", WEMO_PortForDevice(idx));
 	poststr(request, g_wemo_setup_5);
 	poststr(request, g_wemo_setup_6);
 	poststr(request, NULL);
@@ -312,6 +444,21 @@ void WEMO_Init() {
 
 	g_serial = strdup(serial);
 	g_uid = strdup(uid);
+	{
+		int i;
+		// device 0 keeps the original ids, so an already paired Alexa device does not change
+		for (i = 0; i < WEMO_MAX_DEVICES; i++) {
+			if (i == 0) {
+				snprintf(g_devSerial[i], sizeof(g_devSerial[i]), "%s", serial);
+				snprintf(g_devUid[i], sizeof(g_devUid[i]), "%s", uid);
+			}
+			else {
+				snprintf(g_devSerial[i], sizeof(g_devSerial[i]), "%s-%i", serial, i + 1);
+				snprintf(g_devUid[i], sizeof(g_devUid[i]), "Socket-1_0-%s", g_devSerial[i]);
+			}
+		}
+	}
+	WEMO_UpdatePorts();
 
 	HTTP_RegisterCallback("/upnp/control/basicevent1", HTTP_POST, WEMO_BasicEvent1, 0);
 	HTTP_RegisterCallback("/eventservice.xml", HTTP_GET, WEMO_EventService, 0);

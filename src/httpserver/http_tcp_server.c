@@ -52,7 +52,9 @@ int sendfn(int fd, char* data, int len) {
 static void tcp_client_thread(beken_thread_arg_t arg)
 {
 	OSStatus err = kNoErr;
-	int fd = (int)arg;
+	// thread argument packs the socket fd (low 16 bits) and the local TCP port it was accepted on (high 16 bits)
+	int fd = (int)((unsigned int)arg & 0xFFFF);
+	int localPort = (int)((unsigned int)arg >> 16);
 	//fd_set readfds, errfds, readfds2;
 	char* buf = NULL;
 	char* reply = NULL;
@@ -75,6 +77,7 @@ static void tcp_client_thread(beken_thread_arg_t arg)
 	memset(&request, 0, sizeof(request));
 
 	request.fd = fd;
+	request.localPort = localPort;
 	request.received = buf;
 	request.receivedLenmax = INCOMING_BUFFER_SIZE - 2;
 	request.responseCode = HTTP_RESPONSE_OK;
@@ -146,36 +149,112 @@ exit:
 #endif
 }
 
+// Extra listening ports (used by the Wemo driver to expose one virtual device per port).
+// Written by other threads through HTTPServer_SetExtraPort, applied by the server thread.
+static volatile int g_extraPortWanted[HTTP_EXTRA_PORTS_MAX];
+
+void HTTPServer_SetExtraPort(int slot, int port) {
+	if (slot < 0 || slot >= HTTP_EXTRA_PORTS_MAX) {
+		return;
+	}
+	g_extraPortWanted[slot] = port;
+}
+
+static int tcp_open_listen_socket(int port) {
+	struct sockaddr_in server_addr;
+	int fd, err;
+
+	fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (fd < 0) {
+		return -1;
+	}
+	memset(&server_addr, 0, sizeof(server_addr));
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_addr.s_addr = INADDR_ANY;/* Accept conenction request on all network interface */
+	server_addr.sin_port = htons(port);
+	err = bind(fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+	if (err == 0) {
+		err = listen(fd, 0);
+	}
+	if (err != 0) {
+		ADDLOG_ERROR(LOG_FEATURE_HTTP, "HTTP could not listen on port %i", port);
+		lwip_close(fd);
+		return -1;
+	}
+	return fd;
+}
+
 /* TCP server listener thread */
 static void tcp_server_thread(beken_thread_arg_t arg)
 {
 	(void)(arg);
 	OSStatus err = kNoErr;
-	struct sockaddr_in server_addr, client_addr;
+	struct sockaddr_in client_addr;
 	socklen_t sockaddr_t_size = sizeof(client_addr);
 	char client_ip_str[16];
 	int tcp_listen_fd = -1, client_fd = -1;
+	int i, maxfd, ready, listenPort;
+	int extraFd[HTTP_EXTRA_PORTS_MAX];
+	int extraPort[HTTP_EXTRA_PORTS_MAX];
 	fd_set readfds;
+	struct timeval tv;
 
-	tcp_listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	for (i = 0; i < HTTP_EXTRA_PORTS_MAX; i++) {
+		extraFd[i] = -1;
+		extraPort[i] = 0;
+	}
 
-	server_addr.sin_family = AF_INET;
-	server_addr.sin_addr.s_addr = INADDR_ANY;/* Accept conenction request on all network interface */
-	server_addr.sin_port = htons(HTTP_SERVER_PORT);/* Server listen on port: 20000 */
-	err = bind(tcp_listen_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
-
-	err = listen(tcp_listen_fd, 0);
+	tcp_listen_fd = tcp_open_listen_socket(HTTP_SERVER_PORT);
 
 	while (1)
 	{
+		// open or close extra ports if they were requested/released
+		for (i = 0; i < HTTP_EXTRA_PORTS_MAX; i++) {
+			int wanted = g_extraPortWanted[i];
+			if (wanted != extraPort[i]) {
+				if (extraFd[i] >= 0) {
+					lwip_close(extraFd[i]);
+					extraFd[i] = -1;
+				}
+				extraPort[i] = wanted;
+				if (wanted != 0) {
+					extraFd[i] = tcp_open_listen_socket(wanted);
+				}
+			}
+		}
+
 		FD_ZERO(&readfds);
-		FD_SET(tcp_listen_fd, &readfds);
+		maxfd = -1;
+		if (tcp_listen_fd >= 0) {
+			FD_SET(tcp_listen_fd, &readfds);
+			maxfd = tcp_listen_fd;
+		}
+		for (i = 0; i < HTTP_EXTRA_PORTS_MAX; i++) {
+			if (extraFd[i] >= 0) {
+				FD_SET(extraFd[i], &readfds);
+				if (extraFd[i] > maxfd) {
+					maxfd = extraFd[i];
+				}
+			}
+		}
 
-		select(tcp_listen_fd + 1, &readfds, NULL, NULL, NULL);
+		// timeout, so changes to the extra ports are noticed
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		ready = select(maxfd + 1, &readfds, NULL, NULL, &tv);
+		if (ready <= 0) {
+			continue;
+		}
 
-		if (FD_ISSET(tcp_listen_fd, &readfds))
+		// slot -1 is the main HTTP port
+		for (i = -1; i < HTTP_EXTRA_PORTS_MAX; i++)
 		{
-			client_fd = accept(tcp_listen_fd, (struct sockaddr*)&client_addr, &sockaddr_t_size);
+			int lfd = (i < 0) ? tcp_listen_fd : extraFd[i];
+			if (lfd < 0 || !FD_ISSET(lfd, &readfds)) {
+				continue;
+			}
+			listenPort = (i < 0) ? HTTP_SERVER_PORT : extraPort[i];
+			client_fd = accept(lfd, (struct sockaddr*)&client_addr, &sockaddr_t_size);
 			if (client_fd >= 0)
 			{
 #if PLATFORM_XR809
@@ -185,12 +264,13 @@ static void tcp_server_thread(beken_thread_arg_t arg)
 				OS_Thread_t clientThreadUnused;
 #endif
 #endif
+				unsigned int clientArg = ((unsigned int)listenPort << 16) | ((unsigned int)client_fd & 0xFFFF);
 				strcpy(client_ip_str, inet_ntoa(client_addr.sin_addr));
 #if DISABLE_SEPARATE_THREAD_FOR_EACH_TCP_CLIENT
 				//ADDLOG_ERROR(LOG_FEATURE_HTTP, "HTTP [single thread] Client %s:%d connected, fd: %d", client_ip_str, client_addr.sin_port, client_fd);
 				// Use main server thread (blocking all other clients)
 				// right now, I am getting OS_ThreadCreate everytime on XR809 platform
-				tcp_client_thread((beken_thread_arg_t)client_fd);
+				tcp_client_thread((beken_thread_arg_t)clientArg);
 #else
 				//ADDLOG_ERROR(LOG_FEATURE_HTTP, "HTTP [multi thread] Client %s:%d connected, fd: %d", client_ip_str, client_addr.sin_port, client_fd);
 				// delay each accept by 20ms
@@ -205,7 +285,7 @@ static void tcp_server_thread(beken_thread_arg_t arg)
 					OS_ThreadCreate(&clientThreadUnused,
 						"HTTP Client",
 						tcp_client_thread,
-						client_fd,
+						(void*)clientArg,
 						OS_THREAD_PRIO_CONSOLE,
 						0x400)
 
@@ -214,7 +294,7 @@ static void tcp_server_thread(beken_thread_arg_t arg)
 						"HTTP Client",
 						(beken_thread_function_t)tcp_client_thread,
 						HTTP_CLIENT_STACK_SIZE,
-						(beken_thread_arg_t)client_fd)
+						(beken_thread_arg_t)clientArg)
 
 #endif
 					)

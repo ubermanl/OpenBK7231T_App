@@ -56,6 +56,8 @@ typedef struct http_request_tag {
 	int replylen;
 	int replymaxlen;
 	int fd;
+	// TCP port on which this request was received (0 if unknown, treat as 80)
+	int localPort;
 
 	// user variables used to build JSON data
 	int userCounter;
@@ -63,6 +65,15 @@ typedef struct http_request_tag {
 
 
 int HTTP_ProcessPacket(http_request_t* request);
+// Opens (port != 0) or closes (port == 0) an extra listening port for the HTTP server.
+// slot is 0..HTTP_EXTRA_PORTS_MAX-1. Only implemented by http_tcp_server.c, see HTTP_EXTRA_PORTS_SUPPORTED.
+#define HTTP_EXTRA_PORTS_MAX 4
+#if !NEW_TCP_SERVER && !WINDOWS && !LINUX
+#define HTTP_EXTRA_PORTS_SUPPORTED 1
+void HTTPServer_SetExtraPort(int slot, int port);
+#else
+#define HTTP_EXTRA_PORTS_SUPPORTED 0
+#endif
 void http_setup(http_request_t* request, const char* type);
 void http_setup_gz(http_request_t* request, const char* type);
 void http_html_start(http_request_t* request, const char* pagename);
